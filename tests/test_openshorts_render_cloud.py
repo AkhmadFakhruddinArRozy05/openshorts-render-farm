@@ -8,13 +8,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-import sys
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-RENDER_FARM_DIR = PROJECT_DIR / "Tools/OpenShorts-Render-Farm"
-if str(RENDER_FARM_DIR) not in sys.path:
-    sys.path.insert(0, str(RENDER_FARM_DIR))
-
-from scripts.render_cloud import (
+from scripts.render_openshorts_cloud import (
     check_github_rate_limit,
     validate_manifest_file,
     create_temporary_asset_release,

@@ -13,7 +13,7 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 RENDER_FARM_DIR = PROJECT_DIR / "Tools/OpenShorts-Render-Farm"
 if str(RENDER_FARM_DIR) not in sys.path:
-    sys.path.insert(0, str(RENDER_FARM_DIR))
+    sys.path.append(str(RENDER_FARM_DIR))
 
 from engine.layout_engine import (
     validate_job_manifest,

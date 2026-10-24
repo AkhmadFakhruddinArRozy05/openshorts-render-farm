@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "project_id": "PODCAST-SAMPLE-CLIP01",
+  "source": {
+    "type": "url",
+    "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    "local_asset_path": null
+  },
+  "timing": {
+    "start_seconds": 120.0,
+    "end_seconds": 175.0,
+    "duration_seconds": 55.0
+  },
+  "layout": {
+    "mode": "SPLIT",
+    "split_seam_y": 0.5,
+    "crop_smoothing": true
+  },
+  "subtitles": {
+    "enabled": true,
+    "style": "karaoke",
+    "font_size": 24,
+    "color": "#FFFFFF",
+    "highlight_color": "#FFDF00"
+  },
+  "hook_overlay": {
+    "enabled": true,
+    "text": "Rahasia Sukses Terbesar!",
+    "duration_seconds": 4.0
+  },
+  "output_spec": {
+    "resolution": [1080, 1920],
+    "fps": 30,
+    "codec": "libx264"
+  }
+}
