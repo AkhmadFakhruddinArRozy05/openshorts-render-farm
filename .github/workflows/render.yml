@@ -1,0 +1,107 @@
+name: OpenShorts Cloud Render Farm
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: 'JSON string of job_manifest or manifest file name'
+        required: true
+        type: string
+      release_tag:
+        description: 'Temporary GitHub Release tag containing local media assets (leave empty if source is URL)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    name: "Render OpenShorts Clip"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Render Farm Repository
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies & FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libgl1-mesa-glx fonts-liberation
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Cache YOLO Models & Torch
+        id: cache-models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/torch
+            ~/.config/Ultralytics
+            yolov8n.pt
+          key: openshorts-models-${{ runner.os }}-v1
+          restore-keys: |
+            openshorts-models-${{ runner.os }}-
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download Ephemeral Assets from GitHub Release
+        if: "${{ inputs.release_tag != '' }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Downloading assets from release tag: ${{ inputs.release_tag }}"
+          gh release download "${{ inputs.release_tag }}" --dir .
+
+      - name: Parse & Prepare Job Manifest
+        run: |
+          python3 -c "
+          import json, os, sys
+
+          raw_input = os.environ.get('MANIFEST_INPUT', '').strip()
+          manifest_path = 'job_manifest.json'
+
+          if os.path.isfile(raw_input):
+              with open(raw_input, 'r', encoding='utf-8') as f:
+                  data = json.load(f)
+          else:
+              data = json.loads(raw_input)
+
+          with open(manifest_path, 'w', encoding='utf-8') as f:
+              json.dump(data, f, indent=2)
+
+          print(f'Successfully prepared {manifest_path} for project: {data.get(\"project_id\")}')
+          "
+        env:
+          MANIFEST_INPUT: ${{ inputs.manifest }}
+
+      - name: Execute Render Worker
+        run: |
+          python3 engine/render_worker.py --manifest job_manifest.json --output output.mp4
+
+      - name: Verify Output Bitstream & Resolution
+        run: |
+          if [ ! -s output.mp4 ]; then
+            echo "ERROR: output.mp4 does not exist or is 0 bytes!"
+            exit 1
+          fi
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate -of csv=p=0 output.mp4
+          ffmpeg -v error -i output.mp4 -f null -
+          echo "Verification passed: output.mp4 is playable and intact."
+
+      - name: Upload Rendered MP4 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-mp4
+          path: output.mp4
+          retention-days: 1
+          if-no-files-found: error
