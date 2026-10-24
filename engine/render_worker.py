@@ -98,6 +98,20 @@ def build_ffmpeg_render_command(
         filter_complex += drawtext_filter
         current_label = "[v_hook]"
 
+    # Chain outro overlay if enabled
+    outro_cfg = manifest.get("outro_overlay", {})
+    if outro_cfg.get("enabled", False) and (outro_cfg.get("mandatory_text") or outro_cfg.get("text")):
+        outro_text = escape_ffmpeg_text(outro_cfg.get("mandatory_text") or outro_cfg.get("text", ""))
+        outro_dur = float(outro_cfg.get("duration_seconds", 10.0))
+        outro_start = max(0.0, duration_sec - outro_dur)
+        drawtext_outro = (
+            f";{current_label}drawtext=text='{outro_text}':"
+            f"fontcolor=white:fontsize=44:box=1:boxcolor=black@0.75:boxborderw=12:"
+            f"x=(w-text_w)/2:y=h-360:enable='between(t,{outro_start:.2f},{duration_sec:.2f})'[v_outro]"
+        )
+        filter_complex += drawtext_outro
+        current_label = "[v_outro]"
+
     cmd = [
         "ffmpeg",
         "-y",
