@@ -187,3 +187,57 @@ def test_verify_final_mp4(tmp_path):
     empty_mp4 = tmp_path / "empty.mp4"
     empty_mp4.write_bytes(b"")
     assert verify_final_mp4(str(empty_mp4)) is False
+
+
+def test_find_latest_run_id_with_exclude():
+    from scripts.render_openshorts_cloud import find_latest_run_id
+
+    mock_res_old = MagicMock(returncode=0, stdout=json.dumps([{"databaseId": 1111}]), stderr="")
+    mock_res_new = MagicMock(returncode=0, stdout=json.dumps([{"databaseId": 2222}]), stderr="")
+
+    with patch("subprocess.run") as mock_run:
+        # First call returns old run id, second call returns new run id
+        mock_run.side_effect = [mock_res_old, mock_res_new]
+        run_id = find_latest_run_id(
+            repo_name="AkhmadFakhruddinArRozy05/openshorts-render-farm",
+            workflow_name="render.yml",
+            exclude_run_id="1111",
+            max_wait_seconds=5,
+            poll_interval=0,
+        )
+        assert run_id == "2222"
+
+
+def test_url_source_with_local_subtitles_staging(tmp_path, valid_manifest_dict):
+    from scripts.render_openshorts_cloud import run_orchestrator
+
+    manifest_path = tmp_path / "job_manifest.json"
+    manifest_path.write_text(json.dumps(valid_manifest_dict), encoding="utf-8")
+    sub_file = tmp_path / "subtitles.srt"
+    sub_file.write_text("1\n00:00:00,000 --> 00:00:02,000\nHello\n", encoding="utf-8")
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        with patch("openshorts_render_cloud.find_latest_run_id", side_effect=["5555", "5556"]), \
+             patch("openshorts_render_cloud.watch_run_with_timeout", return_value=True), \
+             patch("openshorts_render_cloud.download_rendered_artifact", return_value=True), \
+             patch("openshorts_render_cloud.verify_final_mp4", return_value=True):
+
+            code = run_orchestrator(
+                manifest_path=str(manifest_path),
+                output_path=str(tmp_path / "out.mp4"),
+                repo_name="AkhmadFakhruddinArRozy05/openshorts-render-farm",
+                workflow_name="render.yml",
+            )
+            assert code == 0
+            release_calls = [
+                call for call in mock_run.call_args_list
+                if len(call[0]) > 0 and isinstance(call[0][0], list) and "release" in call[0][0] and "create" in call[0][0]
+            ]
+            assert len(release_calls) == 1
+            args = release_calls[0][0][0]
+            assert any("subtitles.srt" in str(a) for a in args)

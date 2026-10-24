@@ -4,6 +4,7 @@ Provides deterministic layout calculations and FFmpeg filter graph generation
 for SPLIT, TRACK, and GENERAL reframing modes.
 """
 
+import os
 from typing import Any, Dict, Optional, Tuple
 
 VALID_LAYOUT_MODES = {"SPLIT", "TRACK", "GENERAL", "SCREENCAST"}
@@ -21,6 +22,8 @@ def validate_job_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
     for sec in required_sections:
         if sec not in manifest or manifest[sec] is None:
             raise ValueError(f"Missing required manifest section: {sec}")
+        if sec != "project_id" and not isinstance(manifest[sec], dict):
+            raise ValueError(f"Manifest section '{sec}' must be a JSON object")
 
     # Validate project_id
     if not isinstance(manifest["project_id"], str) or not manifest["project_id"].strip():
@@ -31,8 +34,10 @@ def validate_job_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
     src_type = source.get("type")
     if src_type not in ("url", "local"):
         raise ValueError("source.type must be 'url' or 'local'")
-    if src_type == "url" and not source.get("url"):
-        raise ValueError("source.url cannot be empty when source.type is 'url'")
+    if src_type == "url":
+        url = source.get("url", "")
+        if not url or not (url.startswith("http://") or url.startswith("https://")):
+            raise ValueError(f"source.url must be a valid HTTP/HTTPS URL, got: '{url}'")
     if src_type == "local" and not source.get("local_asset_path"):
         raise ValueError("source.local_asset_path cannot be empty when source.type is 'local'")
 
@@ -60,6 +65,11 @@ def validate_job_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
             f"start_seconds ({start_sec}) must be strictly less than end_seconds ({end_sec})"
         )
 
+    if abs((end_sec - start_sec) - dur_sec) > 0.5:
+        raise ValueError(
+            f"duration_seconds ({dur_sec}) does not match end_seconds ({end_sec}) - start_seconds ({start_sec})"
+        )
+
     # Validate layout
     layout = manifest["layout"]
     mode = layout.get("mode")
@@ -71,8 +81,21 @@ def validate_job_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
     res = out_spec.get("resolution")
     if not isinstance(res, (list, tuple)) or len(res) != 2:
         raise ValueError("output_spec.resolution must be a 2-element array [width, height]")
-    if res[0] <= 0 or res[1] <= 0:
-        raise ValueError("output_spec.resolution dimensions must be positive integers")
+    try:
+        w_val = int(res[0])
+        h_val = int(res[1])
+        if w_val <= 0 or h_val <= 0:
+            raise ValueError("output_spec.resolution dimensions must be positive integers")
+    except (TypeError, ValueError):
+        raise ValueError("output_spec.resolution dimensions must be integers")
+
+    fps = out_spec.get("fps", 30)
+    try:
+        fps_val = int(fps)
+        if fps_val <= 0 or fps_val > 120:
+            raise ValueError(f"output_spec.fps must be between 1 and 120, got: {fps}")
+    except (TypeError, ValueError):
+        raise ValueError(f"output_spec.fps must be a valid integer, got: {fps}")
 
     return manifest
 
@@ -219,3 +242,140 @@ def build_track_filter(
         f"scale={out_w}:{out_h},setsar=1[v]"
     )
     return filter_str
+
+
+def detect_person_box_yolo(
+    video_path: str,
+    start_sec: float,
+    duration_sec: float,
+    orig_w: int,
+    orig_h: int,
+) -> Optional[Tuple[float, float, float, float]]:
+    """
+    Samples frames from video_path during the target interval and uses YOLOv8 (yolov8n.pt)
+    to detect the primary person/speaker bounding box (x1, y1, x2, y2).
+    Returns None if YOLO is unavailable, video cannot be opened, or no person is detected.
+    """
+    try:
+        import cv2
+        from ultralytics import YOLO
+    except ImportError:
+        return None
+
+    try:
+        model_path = os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt")
+        model = YOLO(model_path)
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+
+        sample_times = [
+            start_sec + duration_sec * 0.25,
+            start_sec + duration_sec * 0.50,
+            start_sec + duration_sec * 0.75,
+        ]
+
+        detected_boxes = []
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+        for t in sample_times:
+            frame_num = int(t * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                continue
+
+            results = model(frame, classes=[0], verbose=False)
+            if not results:
+                continue
+
+            max_area = 0
+            best_box = None
+            for r in results:
+                for b in r.boxes:
+                    coords = [float(x) for x in b.xyxy[0]]
+                    w = coords[2] - coords[0]
+                    h = coords[3] - coords[1]
+                    area = w * h
+                    if area > max_area:
+                        max_area = area
+                        best_box = (coords[0], coords[1], coords[2], coords[3])
+
+            if best_box:
+                detected_boxes.append(best_box)
+
+        cap.release()
+
+        if not detected_boxes:
+            return None
+
+        avg_x1 = sum(b[0] for b in detected_boxes) / len(detected_boxes)
+        avg_y1 = sum(b[1] for b in detected_boxes) / len(detected_boxes)
+        avg_x2 = sum(b[2] for b in detected_boxes) / len(detected_boxes)
+        avg_y2 = sum(b[3] for b in detected_boxes) / len(detected_boxes)
+
+        return (avg_x1, avg_y1, avg_x2, avg_y2)
+    except Exception as e:
+        print(f"⚠️ [YOLO] Detection exception: {e}, falling back to center layout")
+        return None
+
+
+def detect_split_speakers_yolo(
+    video_path: str,
+    start_sec: float,
+    duration_sec: float,
+    orig_w: int,
+    orig_h: int,
+) -> Tuple[Optional[Tuple[float, float, float, float]], Optional[Tuple[float, float, float, float]]]:
+    """
+    Samples video to detect two distinct speakers for SPLIT layout.
+    Returns (left_centre, right_centre) or (None, None) if detection falls back.
+    """
+    try:
+        import cv2
+        from ultralytics import YOLO
+    except ImportError:
+        return None, None
+
+    try:
+        model_path = os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt")
+        model = YOLO(model_path)
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None, None
+
+        mid_time = start_sec + duration_sec * 0.5
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(mid_time * fps))
+        ret, frame = cap.read()
+        cap.release()
+
+        if not ret or frame is None:
+            return None, None
+
+        results = model(frame, classes=[0], verbose=False)
+        if not results:
+            return None, None
+
+        persons = []
+        for r in results:
+            for b in r.boxes:
+                coords = [float(x) for x in b.xyxy[0]]
+                cx = (coords[0] + coords[2]) / 2.0
+                cy = (coords[1] + coords[3]) / 2.0
+                bw = coords[2] - coords[0]
+                bh = coords[3] - coords[1]
+                if bw > orig_w * 0.05:  # ignore small noise
+                    persons.append((cx, cy, bw, bh))
+
+        if len(persons) >= 2:
+            persons.sort(key=lambda p: p[0])
+            left = persons[0]
+            right = persons[-1]
+            if (right[0] - left[0]) > orig_w * 0.15:
+                return left, right
+
+        return None, None
+    except Exception as e:
+        print(f"⚠️ [YOLO] Split detection exception: {e}")
+        return None, None

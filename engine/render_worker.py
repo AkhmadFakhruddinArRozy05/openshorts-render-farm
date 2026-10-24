@@ -28,6 +28,8 @@ from layout_engine import (
     build_split_filter,
     build_general_filter,
     build_track_filter,
+    detect_person_box_yolo,
+    detect_split_speakers_yolo,
 )
 
 
@@ -35,9 +37,8 @@ def escape_ffmpeg_text(text: str) -> str:
     """Escapes single quotes and special characters for FFmpeg drawtext."""
     if not text:
         return ""
-    # Replace backslash first, then single quote, colon, percent
-    escaped = text.replace("\\", "\\\\").replace("'", "'\\''").replace(":", "\\:").replace("%", "\\%")
-    return escaped
+    # Replace backslash first, then colon, single quote, percent
+    return str(text).replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'").replace("%", r"\%")
 
 
 def escape_ffmpeg_path(path: str) -> str:
@@ -100,10 +101,10 @@ def build_ffmpeg_render_command(
     cmd = [
         "ffmpeg",
         "-y",
-        "-avoid_negative_ts", "make_zero",
         "-ss", str(start_sec),
         "-t", str(duration_sec),
         "-i", source_path,
+        "-avoid_negative_ts", "make_zero",
         "-filter_complex", filter_complex,
         "-map", current_label,
         "-map", "0:a?",
@@ -139,12 +140,31 @@ def probe_video_dimensions(video_path: str) -> Tuple[int, int]:
         return 1920, 1080
 
 
-def verify_rendered_mp4(output_path: str) -> bool:
-    """Verifies that output file exists, is non-empty, and passes ffprobe decode test."""
+def verify_rendered_mp4(
+    output_path: str,
+    expected_resolution: Optional[Tuple[int, int]] = (1080, 1920),
+) -> bool:
+    """Verifies that output file exists, is non-empty, matches expected resolution, and passes ffprobe decode test."""
     p = Path(output_path)
     if not p.exists() or p.stat().st_size == 0:
         return False
     try:
+        if expected_resolution:
+            cmd_probe = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x",
+                str(p),
+            ]
+            probe_res = subprocess.run(cmd_probe, capture_output=True, text=True, timeout=15)
+            if probe_res.returncode == 0:
+                dim = probe_res.stdout.strip()
+                exp_str = f"{expected_resolution[0]}x{expected_resolution[1]}"
+                if exp_str not in dim:
+                    print(f"⚠️ [WORKER] Output resolution {dim} does not match expected {exp_str}")
+                    return False
+
         cmd = ["ffmpeg", "-v", "error", "-i", str(p), "-f", "null", "-"]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         return res.returncode == 0
@@ -187,9 +207,18 @@ def run_worker(manifest_path: str, output_path: str) -> int:
             print("❌ [WORKER] yt-dlp download failed!")
             return 1
     else:
-        input_file = source_cfg.get("local_asset_path")
-        if not input_file or not Path(input_file).exists():
-            print(f"❌ [WORKER] Local asset does not exist: {input_file}")
+        local_path = source_cfg.get("local_asset_path")
+        if not local_path:
+            print("❌ [WORKER] Missing source.local_asset_path")
+            return 1
+
+        candidate = Path(local_path)
+        if candidate.is_file():
+            input_file = str(candidate)
+        elif Path(candidate.name).is_file():
+            input_file = candidate.name
+        else:
+            print(f"❌ [WORKER] Local asset does not exist: {local_path} (also checked {candidate.name})")
             return 1
 
     # Step 2: Dimensions & Layout filter
@@ -200,22 +229,45 @@ def run_worker(manifest_path: str, output_path: str) -> int:
     res = manifest.get("output_spec", {}).get("resolution", [1080, 1920])
     out_w, out_h = res[0], res[1]
 
+    timing = manifest["timing"]
+    start_sec = float(timing["start_seconds"])
+    dur_sec = float(timing["duration_seconds"])
+
     if layout_mode == "SPLIT":
-        print("👥 [WORKER] Building SPLIT layout filtergraph...")
-        fgraph = build_split_filter(in_w, in_h, out_w, out_h)
+        print("👥 [WORKER] Checking YOLO speaker coordinates for SPLIT layout...")
+        left_c, right_c = detect_split_speakers_yolo(input_file, start_sec, dur_sec, in_w, in_h)
+        fgraph = build_split_filter(in_w, in_h, out_w, out_h, left_centre=left_c, right_centre=right_c)
     elif layout_mode == "TRACK":
-        print("🎯 [WORKER] Building TRACK layout filtergraph...")
-        fgraph = build_track_filter(in_w, in_h, out_w, out_h)
+        print("🎯 [WORKER] Running YOLOv8 face/person tracking for TRACK layout...")
+        face_box = detect_person_box_yolo(input_file, start_sec, dur_sec, in_w, in_h)
+        fgraph = build_track_filter(in_w, in_h, out_w, out_h, face_box=face_box)
     else:
         print("🖼️ [WORKER] Building GENERAL blurred background filtergraph...")
         fgraph = build_general_filter(in_w, in_h, out_w, out_h)
 
     # Step 3: Subtitles
     sub_path = None
-    if Path("subtitles.srt").exists():
-        sub_path = "subtitles.srt"
-    elif Path("subtitles.ass").exists():
-        sub_path = "subtitles.ass"
+    subs_cfg = manifest.get("subtitles", {})
+    if subs_cfg.get("enabled", False):
+        if subs_cfg.get("file_path"):
+            fp = Path(subs_cfg["file_path"])
+            if fp.is_file():
+                sub_path = str(fp)
+            elif Path(fp.name).is_file():
+                sub_path = fp.name
+        if not sub_path:
+            if Path("subtitles.srt").is_file():
+                sub_path = "subtitles.srt"
+            elif Path("subtitles.ass").is_file():
+                sub_path = "subtitles.ass"
+            else:
+                for f in Path(".").glob("*.srt"):
+                    sub_path = str(f)
+                    break
+                if not sub_path:
+                    for f in Path(".").glob("*.ass"):
+                        sub_path = str(f)
+                        break
 
     # Step 4: Render FFmpeg
     cmd = build_ffmpeg_render_command(
@@ -234,8 +286,8 @@ def run_worker(manifest_path: str, output_path: str) -> int:
 
     # Step 5: Verification
     print("🔍 [WORKER] Verifying output MP4 integrity...")
-    if not verify_rendered_mp4(output_path):
-        print("❌ [WORKER] Rendered artifact verification failed (corrupt or unplayable)!")
+    if not verify_rendered_mp4(output_path, expected_resolution=(out_w, out_h)):
+        print("❌ [WORKER] Rendered artifact verification failed (corrupt or resolution mismatch)!")
         return 1
 
     print(f"✅ [WORKER] Render completed successfully! Saved to: {output_path}")

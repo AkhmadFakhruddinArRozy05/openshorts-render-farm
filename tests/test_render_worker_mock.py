@@ -183,6 +183,11 @@ def test_build_ffmpeg_render_command(sample_valid_manifest, tmp_path):
 
     cmd_str = " ".join(cmd)
     assert "-avoid_negative_ts make_zero" in cmd_str
+    # Verify -avoid_negative_ts is placed after -i (GEMINI.md rule)
+    i_idx = cmd.index("-i")
+    avoid_idx = cmd.index("-avoid_negative_ts")
+    assert avoid_idx > i_idx, "-avoid_negative_ts must be placed after -i"
+
     assert "-ss 120.0" in cmd_str
     assert "-t 55.0" in cmd_str
     assert "-c:v libx264" in cmd_str
@@ -190,3 +195,35 @@ def test_build_ffmpeg_render_command(sample_valid_manifest, tmp_path):
     assert "subtitles=" in cmd_str
     assert "drawtext=" in cmd_str
     assert str(output_file) in cmd
+
+
+def test_validate_job_manifest_duration_mismatch(sample_valid_manifest):
+    bad = dict(sample_valid_manifest)
+    bad["timing"] = {"start_seconds": 10.0, "end_seconds": 30.0, "duration_seconds": 50.0}
+    with pytest.raises(ValueError, match="does not match end_seconds"):
+        validate_job_manifest(bad)
+
+
+def test_validate_job_manifest_non_dict_section(sample_valid_manifest):
+    bad = dict(sample_valid_manifest)
+    bad["layout"] = "SPLIT"
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        validate_job_manifest(bad)
+
+
+def test_validate_job_manifest_invalid_url_scheme(sample_valid_manifest):
+    bad = dict(sample_valid_manifest)
+    bad["source"] = {"type": "url", "url": "ftp://example.com/video.mp4"}
+    with pytest.raises(ValueError, match="must be a valid HTTP/HTTPS URL"):
+        validate_job_manifest(bad)
+
+
+def test_yolo_detection_graceful_fallback(tmp_path):
+    from engine.layout_engine import detect_person_box_yolo, detect_split_speakers_yolo
+    # Video file does not exist or YOLO not present in environment
+    res = detect_person_box_yolo(str(tmp_path / "nonexistent.mp4"), 0.0, 10.0, 1920, 1080)
+    assert res is None
+
+    left, right = detect_split_speakers_yolo(str(tmp_path / "nonexistent.mp4"), 0.0, 10.0, 1920, 1080)
+    assert left is None
+    assert right is None

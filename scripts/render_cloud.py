@@ -41,6 +41,8 @@ def check_github_rate_limit(min_remaining: int = GITHUB_API_MIN_REMAINING) -> Op
         res = subprocess.run(["gh", "api", "rate_limit"], capture_output=True, text=True, timeout=10)
         if res.returncode == 0:
             data = json.loads(res.stdout)
+            if not isinstance(data, dict):
+                return None
             core = data.get("resources", {}).get("core", {})
             remaining = core.get("remaining", 5000)
             limit = core.get("limit", 5000)
@@ -129,9 +131,16 @@ def trigger_workflow_run(repo_name: str, workflow_name: str, inputs: Dict[str, s
     return True
 
 
-def find_latest_run_id(repo_name: str, workflow_name: str) -> Optional[str]:
+def find_latest_run_id(
+    repo_name: str,
+    workflow_name: str,
+    exclude_run_id: Optional[str] = None,
+    max_wait_seconds: int = 30,
+    poll_interval: int = 2,
+) -> Optional[str]:
     """
     Finds the most recently dispatched run ID for the given workflow.
+    Polls up to max_wait_seconds to identify a newly queued/running run (excluding exclude_run_id).
     """
     cmd = [
         "gh", "run", "list",
@@ -140,14 +149,21 @@ def find_latest_run_id(repo_name: str, workflow_name: str) -> Optional[str]:
         "--limit", "1",
         "--json", "databaseId",
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode == 0 and res.stdout.strip():
-        try:
-            items = json.loads(res.stdout)
-            if items and isinstance(items, list):
-                return str(items[0]["databaseId"])
-        except Exception:
-            pass
+    start_time = time.time()
+    while True:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout.strip():
+            try:
+                items = json.loads(res.stdout)
+                if items and isinstance(items, list):
+                    candidate_id = str(items[0]["databaseId"])
+                    if exclude_run_id is None or candidate_id != str(exclude_run_id):
+                        return candidate_id
+            except Exception:
+                pass
+        if time.time() - start_time >= max_wait_seconds:
+            break
+        time.sleep(poll_interval)
     return None
 
 
@@ -203,7 +219,16 @@ def download_rendered_artifact(repo_name: str, run_id: str, output_path: str) ->
 
         shutil.copy2(str(found_mp4), str(target))
 
-    return target.exists() and target.stat().st_size > 0
+    if not target.exists() or target.stat().st_size == 0:
+        return False
+
+    sz_mb = target.stat().st_size / (1024 * 1024)
+    if sz_mb >= 500:
+        print(f"⚠️ [ARTIFACT WARNING] File '{target.name}' ({sz_mb:.2f} MB) exceeds GitHub Actions 500 MB limit!")
+    elif sz_mb >= 400:
+        print(f"⚠️ [ARTIFACT WARNING] File '{target.name}' ({sz_mb:.2f} MB) is approaching 500 MB limit (>= 400 MB).")
+
+    return True
 
 
 def verify_final_mp4(output_path: str) -> bool:
@@ -278,7 +303,7 @@ def run_orchestrator(
         print("🔍 [DRY-RUN] Manifest and rate limit validated successfully. Halting before cloud dispatch.")
         return 0
 
-    # 3. Handle local media upload if needed
+    # 3. Handle local media and subtitle assets upload if needed
     source_cfg = manifest["source"]
     release_tag = ""
     local_files = []
@@ -288,14 +313,20 @@ def run_orchestrator(
         if not local_path or not Path(local_path).is_file():
             print(f"❌ Local asset does not exist: {local_path}")
             return 1
-        local_files.append(local_path)
+        local_files.append(str(Path(local_path).resolve()))
 
-        # Also check for local subtitles
-        for sub_name in ["subtitles.srt", "subtitles.ass"]:
-            candidate = Path(manifest_path).parent / sub_name
-            if candidate.is_file():
-                local_files.append(str(candidate))
+    # Check for local subtitles next to manifest or in raw/
+    manifest_dir = Path(manifest_path).resolve().parent
+    for sub_name in ["subtitles.srt", "subtitles.ass"]:
+        for candidate_path in [
+            manifest_dir / sub_name,
+            manifest_dir / "raw" / sub_name,
+        ]:
+            if candidate_path.is_file() and str(candidate_path) not in local_files:
+                local_files.append(str(candidate_path))
+                break
 
+    if local_files:
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         tag_name = f"temp-assets-{manifest['project_id']}-{timestamp}"
         try:
@@ -306,6 +337,9 @@ def run_orchestrator(
 
     # 4. Trigger workflow run
     print("🚀 [STAGE 3] Dispatching workflow run to GitHub Actions...")
+    # Get previous latest run id so we don't accidentally attach to an old run
+    old_run_id = find_latest_run_id(repo_name, workflow_name, max_wait_seconds=2)
+
     manifest_json_str = json.dumps(manifest)
     inputs = {
         "manifest": manifest_json_str,
@@ -317,9 +351,13 @@ def run_orchestrator(
             delete_temporary_asset_release(repo_name, release_tag)
         return 1
 
-    # Wait for run to register
-    time.sleep(5)
-    run_id = find_latest_run_id(repo_name, workflow_name)
+    print("⏳ Waiting for GitHub Actions run to register...")
+    run_id = find_latest_run_id(
+        repo_name,
+        workflow_name,
+        exclude_run_id=old_run_id,
+        max_wait_seconds=30,
+    )
     if not run_id:
         print("❌ Could not determine dispatched run ID!")
         if release_tag:
